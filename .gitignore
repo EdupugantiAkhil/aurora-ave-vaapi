@@ -1,0 +1,4 @@
+*.so
+va-dispatch/test_dispatch
+build/
+result

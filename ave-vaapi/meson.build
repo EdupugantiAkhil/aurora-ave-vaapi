@@ -1,0 +1,107 @@
+project(
+  'ave-vaapi-driver',
+  'c', 'cpp',
+  version: '0.12.0',
+  license: 'MIT',
+  meson_version: '>=1.2.0',
+  default_options: [
+    'c_std=c11',
+    'cpp_std=c++17',
+    'warning_level=3',
+    'werror=true',
+  ],
+)
+
+libva_dep = dependency('libva', version: '>=1.20')
+libdrm_dep = dependency('libdrm')
+threads_dep = dependency('threads')
+
+add_project_arguments(
+  '-D_GNU_SOURCE',
+  '-DVENUS_VAAPI_PROBE_LIMIT=@0@'.format(get_option('probe_limit')),
+  language: 'c',
+)
+
+project_inc = include_directories('src')
+
+common_sources = files(
+  'src/capabilities.c',
+  'src/encode_params.c',
+  'src/surface_import.c',
+  'src/v4l2_probe.c',
+)
+
+codec_sources = files(
+  'src/bit_writer.c',
+  'src/h264_annexb.c',
+  'src/hevc_annexb.cpp',
+)
+
+decoder_sources = files(
+  'src/v4l2_decoder.c',
+)
+
+encoder_sources = files(
+  'src/v4l2_encoder.c',
+)
+
+driver_sources = common_sources + codec_sources + decoder_sources + encoder_sources + files(
+  'src/backend.c',
+  'src/decode.c',
+  'src/encode.c',
+  'src/driver.c',
+  'src/objects.c',
+  'src/va_stubs.c',
+)
+
+# Host-only checks: no V4L2 device is opened (see tests/).
+driver_test_lib = static_library(
+  'ave_driver_for_tests',
+  driver_sources,
+  include_directories: project_inc,
+  dependencies: [libva_dep, libdrm_dep, threads_dep],
+)
+
+test('ave-units',
+  executable('test_ave_units', 'tests/test_ave_units.c',
+    include_directories: project_inc,
+    link_with: driver_test_lib,
+    dependencies: [libva_dep, libdrm_dep, threads_dep]))
+
+test('chrome-gating',
+  executable('test_chrome_gating', 'tests/test_chrome_gating.c',
+    include_directories: project_inc,
+    link_with: driver_test_lib,
+    dependencies: [libva_dep, libdrm_dep, threads_dep]))
+
+test('fake-ave',
+  executable('test_fake_ave', 'tests/test_fake_ave.c',
+    include_directories: project_inc,
+    link_with: driver_test_lib,
+    dependencies: [libva_dep, libdrm_dep, threads_dep],
+    link_args: [
+      '-Wl,--wrap=open', '-Wl,--wrap=open64', '-Wl,--wrap=__open_2',
+      '-Wl,--wrap=__open64_2', '-Wl,--wrap=ioctl', '-Wl,--wrap=mmap',
+      '-Wl,--wrap=mmap64', '-Wl,--wrap=munmap', '-Wl,--wrap=close',
+      '-Wl,--wrap=poll', '-Wl,--wrap=__poll_chk',
+    ]))
+
+ave_driver = shared_module(
+  'ave_drv_video',
+  driver_sources,
+  include_directories: project_inc,
+  dependencies: [libva_dep, libdrm_dep, threads_dep],
+  name_prefix: '',
+  gnu_symbol_visibility: 'hidden',
+  install: true,
+  install_dir: join_paths(get_option('libdir'), 'dri'),
+)
+
+summary(
+  {
+    'VA driver': ave_driver.full_path(),
+    'Install directory': join_paths(get_option('libdir'), 'dri'),
+    'libva': libva_dep.version(),
+  },
+  section: 'ave-vaapi-driver',
+)

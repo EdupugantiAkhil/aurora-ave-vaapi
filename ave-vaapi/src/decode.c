@@ -1,0 +1,962 @@
+// SPDX-License-Identifier: MIT
+#include "backend_internal.h"
+
+#include "h264_annexb.h"
+#include "hevc_annexb.h"
+
+#include <errno.h>
+#include <limits.h>
+#include <linux/videodev2.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <va/va_dec_vp8.h>
+#include <va/va_dec_vp9.h>
+
+#define VENUS_MAX_SLICE_BATCHES 64
+#define VENUS_ACCESS_UNIT_OVERHEAD 4096u
+#define VENUS_SYNC_TIMEOUT_MS 30000
+
+/*
+ * VA decode collects picture and slice buffers during Begin/Render/EndPicture.
+ * The H.264 adapter turns that batch into one Annex-B access unit, submits it
+ * to stateful V4L2, and copies the returned NV12 frame into the requested VA
+ * surface. The copy keeps surface ownership independent from the MMAP queue.
+ */
+static int64_t monotonic_milliseconds(void)
+{
+    struct timespec timestamp;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &timestamp) != 0)
+        return -1;
+    return (int64_t)timestamp.tv_sec * 1000 +
+           timestamp.tv_nsec / 1000000;
+}
+
+static void clear_pending(struct venus_context *context)
+{
+    context->pending_count = 0;
+}
+
+static void destroy_context_buffers(struct venus_backend *backend,
+                                    VAContextID context_id)
+{
+    unsigned int index;
+
+    for (index = 0; index < VENUS_MAX_BUFFERS; index++) {
+        if (backend->buffers[index].used &&
+            backend->buffers[index].context_id == context_id)
+            venus_backend_free_buffer(&backend->buffers[index]);
+    }
+}
+
+int venus_decode_store_frame_locked(
+    const struct venus_v4l2_frame *frame, void *opaque)
+{
+    struct venus_backend *backend = opaque;
+    struct venus_surface *surface;
+    uint32_t stride;
+    uint32_t row_bytes;
+    size_t source_uv_offset;
+    int status;
+
+    if (!frame || frame->tag > UINT32_MAX ||
+        frame->width == 0 || frame->height == 0 ||
+        (frame->width & 1u) || (frame->height & 1u))
+        return -EINVAL;
+    if (frame->flags & V4L2_BUF_FLAG_ERROR)
+        return -EIO;
+
+    surface = venus_backend_find_surface(
+        backend, (VASurfaceID)frame->tag);
+    if (!surface)
+        return -ENOENT;
+    if (surface->width > frame->width ||
+        surface->height > frame->height)
+        return -EINVAL;
+
+    if (surface->fourcc != VA_FOURCC_NV12 &&
+        surface->fourcc != VA_FOURCC_P010)
+        return -ENOTSUP;
+    row_bytes = frame->width *
+                (surface->fourcc == VA_FOURCC_P010 ? 2u : 1u);
+    stride = frame->bytes_per_line
+                 ? frame->bytes_per_line
+                 : row_bytes;
+    if (stride < row_bytes ||
+        stride > SIZE_MAX / frame->height)
+        return -EINVAL;
+    source_uv_offset = (size_t)stride * frame->height;
+
+    status = venus_surface_copy_from_yuv420(
+        surface, frame->data, frame->size, stride,
+        source_uv_offset, surface->width, surface->height);
+    if (status < 0)
+        return status;
+
+    return 0;
+}
+
+static VAStatus backend_create_context(
+    VADriverContextP driver_context, VAConfigID config_id,
+    int picture_width, int picture_height, int flags,
+    VASurfaceID *render_targets, int num_render_targets,
+    VAContextID *result)
+{
+    struct venus_backend *backend =
+        venus_backend_from_context(driver_context);
+    struct venus_v4l2_decoder_config decoder_config;
+    struct venus_v4l2_error decoder_error;
+    struct venus_config *config;
+    struct venus_context *context = NULL;
+    unsigned int index;
+    int status;
+
+    (void)flags;
+
+    if (!backend || !result || picture_width < 0 ||
+        picture_height < 0 || num_render_targets < 0 ||
+        (num_render_targets > 0 && !render_targets))
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if ((unsigned int)picture_width < VENUS_MIN_WIDTH ||
+        (unsigned int)picture_height < VENUS_MIN_HEIGHT ||
+        (unsigned int)picture_width > VENUS_MAX_WIDTH ||
+        (unsigned int)picture_height > VENUS_MAX_HEIGHT)
+        return VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED;
+
+    pthread_mutex_lock(&backend->mutex);
+    config = venus_backend_find_config(backend, config_id);
+    if (!config) {
+        pthread_mutex_unlock(&backend->mutex);
+        return VA_STATUS_ERROR_INVALID_CONFIG;
+    }
+
+    for (index = 0; index < (unsigned int)num_render_targets; index++) {
+        struct venus_surface *surface =
+            venus_backend_find_surface(backend, render_targets[index]);
+        uint32_t expected_fourcc =
+            config->profile == VAProfileHEVCMain10
+                ? VA_FOURCC_P010 : VA_FOURCC_NV12;
+
+        if (!surface || surface->width != (unsigned int)picture_width ||
+            surface->height != (unsigned int)picture_height ||
+            surface->fourcc != expected_fourcc) {
+            pthread_mutex_unlock(&backend->mutex);
+            return VA_STATUS_ERROR_INVALID_SURFACE;
+        }
+    }
+
+    for (index = 0; index < VENUS_MAX_CONTEXTS; index++) {
+        if (!backend->contexts[index].used) {
+            context = &backend->contexts[index];
+            break;
+        }
+    }
+    if (!context) {
+        pthread_mutex_unlock(&backend->mutex);
+        return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
+    }
+
+    if (config->entrypoint == VAEntrypointVLD) {
+        decoder_config = (struct venus_v4l2_decoder_config) {
+            .device = backend->capabilities.decoder_path,
+            .coded_format =
+                config->profile == VAProfileVP8Version0_3
+                    ? V4L2_PIX_FMT_VP8
+                    : config->profile == VAProfileVP9Profile0
+                          ? V4L2_PIX_FMT_VP9
+                    : config->profile == VAProfileHEVCMain ||
+                      config->profile == VAProfileHEVCMain10
+                          ? V4L2_PIX_FMT_HEVC
+                          : V4L2_PIX_FMT_H264,
+            .raw_format = config->profile == VAProfileHEVCMain10
+                              ? V4L2_PIX_FMT_P010 : V4L2_PIX_FMT_NV12,
+            .width = (uint32_t)picture_width,
+            .height = (uint32_t)picture_height,
+            .output_buffer_size = config->profile == VAProfileHEVCMain ||
+                                          config->profile == VAProfileHEVCMain10
+                                      ? 8u * 1024u * 1024u
+                                      : 2u * 1024u * 1024u,
+            .output_buffers = 4,
+            .capture_buffers = 16,
+        };
+
+        status = venus_v4l2_decoder_open(
+            &decoder_config, &context->decoder, &decoder_error);
+        if (status < 0) {
+            pthread_mutex_unlock(&backend->mutex);
+            return venus_backend_status_from_errno(status);
+        }
+    } else if (config->entrypoint != VAEntrypointEncSlice) {
+        pthread_mutex_unlock(&backend->mutex);
+        return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
+    }
+
+    context->used = true;
+    context->id =
+        VENUS_CONTEXT_BASE | (unsigned int)(context - backend->contexts + 1);
+    context->config_id = config_id;
+    context->width = (unsigned int)picture_width;
+    context->backend = backend;
+    context->height = (unsigned int)picture_height;
+    context->target = VA_INVALID_ID;
+    context->encode_delivery_sequence = 1;
+
+    for (index = 0; index < (unsigned int)num_render_targets; index++) {
+        struct venus_surface *surface =
+            venus_backend_find_surface(backend, render_targets[index]);
+
+        surface->context_id = context->id;
+    }
+
+    *result = context->id;
+    pthread_mutex_unlock(&backend->mutex);
+    return VA_STATUS_SUCCESS;
+}
+
+static void destroy_context_locked(struct venus_backend *backend,
+                                   struct venus_context *context)
+{
+    unsigned int index;
+
+    if (!context || !context->used)
+        return;
+
+    venus_v4l2_decoder_close(context->decoder);
+    venus_hevc_state_free(context->hevc_state);
+    venus_encode_close_context(context);
+    clear_pending(context);
+    destroy_context_buffers(backend, context->id);
+
+    for (index = 0; index < VENUS_MAX_SURFACES; index++) {
+        if (backend->surfaces[index].used &&
+            backend->surfaces[index].context_id == context->id) {
+            backend->surfaces[index].context_id = VA_INVALID_ID;
+            backend->surfaces[index].encode_pending = false;
+            backend->surfaces[index].coded_buffer_id = VA_INVALID_ID;
+        }
+    }
+
+    memset(context, 0, sizeof(*context));
+}
+
+static VAStatus backend_destroy_context(VADriverContextP driver_context,
+                                        VAContextID context_id)
+{
+    struct venus_backend *backend =
+        venus_backend_from_context(driver_context);
+    struct venus_context *context;
+
+    if (!backend)
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+    pthread_mutex_lock(&backend->mutex);
+    context = venus_backend_find_context(backend, context_id);
+    if (!context) {
+        pthread_mutex_unlock(&backend->mutex);
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+
+    destroy_context_locked(backend, context);
+    pthread_mutex_unlock(&backend->mutex);
+    return VA_STATUS_SUCCESS;
+}
+
+static VAStatus backend_begin_picture(VADriverContextP driver_context,
+                                      VAContextID context_id,
+                                      VASurfaceID render_target)
+{
+    struct venus_backend *backend =
+        venus_backend_from_context(driver_context);
+    struct venus_context *context;
+    struct venus_config *config;
+    struct venus_surface *surface;
+
+    if (!backend)
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+    pthread_mutex_lock(&backend->mutex);
+    context = venus_backend_find_context(backend, context_id);
+    surface = venus_backend_find_surface(backend, render_target);
+    if (!context) {
+        pthread_mutex_unlock(&backend->mutex);
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+    config = venus_backend_find_config(backend, context->config_id);
+    if (!config) {
+        pthread_mutex_unlock(&backend->mutex);
+        return VA_STATUS_ERROR_INVALID_CONFIG;
+    }
+    if (!surface ||
+        surface->fourcc !=
+            (config->profile == VAProfileHEVCMain10
+                 ? VA_FOURCC_P010 : VA_FOURCC_NV12) ||
+        (config->entrypoint == VAEntrypointVLD &&
+         (surface->width != context->width ||
+          surface->height != context->height)) ||
+        (config->entrypoint == VAEntrypointEncSlice &&
+         (surface->width > context->width ||
+          surface->height > context->height))) {
+        pthread_mutex_unlock(&backend->mutex);
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+    if (context->in_picture) {
+        pthread_mutex_unlock(&backend->mutex);
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+    if (surface->encode_pending) {
+        VAStatus sync_status = venus_encode_sync_surface_locked(
+            backend, surface, VENUS_SYNC_TIMEOUT_MS);
+
+        if (sync_status != VA_STATUS_SUCCESS) {
+            pthread_mutex_unlock(&backend->mutex);
+            return sync_status;
+        }
+    }
+    if (config->entrypoint == VAEntrypointEncSlice &&
+        (!surface->ready || surface->data_size == 0)) {
+        pthread_mutex_unlock(&backend->mutex);
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+
+    context->in_picture = true;
+    context->target = render_target;
+    context->pending_count = 0;
+    surface->context_id = context_id;
+    if (config->entrypoint == VAEntrypointVLD) {
+        surface->ready = false;
+        surface->data_size = 0;
+    }
+
+    pthread_mutex_unlock(&backend->mutex);
+    return VA_STATUS_SUCCESS;
+}
+
+static VAStatus backend_render_picture(VADriverContextP driver_context,
+                                       VAContextID context_id,
+                                       VABufferID *buffers,
+                                       int num_buffers)
+{
+    struct venus_backend *backend =
+        venus_backend_from_context(driver_context);
+    struct venus_context *context;
+    int index;
+
+    if (!backend || num_buffers < 0 ||
+        (num_buffers > 0 && !buffers))
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    pthread_mutex_lock(&backend->mutex);
+    context = venus_backend_find_context(backend, context_id);
+    if (!context || !context->in_picture) {
+        pthread_mutex_unlock(&backend->mutex);
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+    if (context->pending_count + (size_t)num_buffers >
+        VENUS_MAX_PENDING_BUFFERS) {
+        pthread_mutex_unlock(&backend->mutex);
+        return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
+    }
+
+    for (index = 0; index < num_buffers; index++) {
+        struct venus_buffer *buffer =
+            venus_backend_find_buffer(backend, buffers[index]);
+
+        if (!buffer || buffer->context_id != context_id) {
+            pthread_mutex_unlock(&backend->mutex);
+            return VA_STATUS_ERROR_INVALID_BUFFER;
+        }
+    }
+
+    for (index = 0; index < num_buffers; index++)
+        context->pending[context->pending_count++] = buffers[index];
+
+    pthread_mutex_unlock(&backend->mutex);
+    return VA_STATUS_SUCCESS;
+}
+
+static int collect_h264_buffers(
+    struct venus_backend *backend, struct venus_context *context,
+    const VAPictureParameterBufferH264 **picture,
+    struct venus_h264_slice_batch *batches, size_t *num_batches,
+    size_t *access_unit_capacity)
+{
+    struct venus_buffer *slice_parameters = NULL;
+    size_t index;
+
+    *picture = NULL;
+    *num_batches = 0;
+    *access_unit_capacity = VENUS_ACCESS_UNIT_OVERHEAD;
+
+    for (index = 0; index < context->pending_count; index++) {
+        struct venus_buffer *buffer = venus_backend_find_buffer(
+            backend, context->pending[index]);
+        size_t buffer_size;
+
+        if (!buffer || buffer->element_size >
+                           SIZE_MAX / buffer->num_elements)
+            return -EINVAL;
+        buffer_size = buffer->element_size * buffer->num_elements;
+
+        switch (buffer->type) {
+        case VAPictureParameterBufferType:
+            if (*picture || buffer->num_elements != 1 ||
+                buffer->element_size <
+                    sizeof(VAPictureParameterBufferH264))
+                return -EINVAL;
+            *picture =
+                (const VAPictureParameterBufferH264 *)buffer->data;
+            break;
+        case VAIQMatrixBufferType:
+            break;
+        case VASliceParameterBufferType:
+            if (slice_parameters ||
+                buffer->element_size <
+                    sizeof(VASliceParameterBufferH264))
+                return -EINVAL;
+            slice_parameters = buffer;
+            break;
+        case VASliceDataBufferType:
+            if (!slice_parameters ||
+                *num_batches >= VENUS_MAX_SLICE_BATCHES)
+                return -EINVAL;
+            batches[*num_batches] =
+                (struct venus_h264_slice_batch) {
+                    .parameters =
+                        (const VASliceParameterBufferH264 *)
+                            slice_parameters->data,
+                    .num_parameters =
+                        slice_parameters->num_elements,
+                    .data = buffer->data,
+                    .data_size = buffer_size,
+                };
+            (*num_batches)++;
+            slice_parameters = NULL;
+            if (buffer_size >
+                SIZE_MAX - *access_unit_capacity)
+                return -EOVERFLOW;
+            *access_unit_capacity += buffer_size;
+            break;
+        default:
+            return -ENOTSUP;
+        }
+    }
+
+    if (!*picture || *num_batches == 0 || slice_parameters)
+        return -EINVAL;
+    return 0;
+}
+
+static int collect_hevc_buffers(
+    struct venus_backend *backend, struct venus_context *context,
+    const VAPictureParameterBufferHEVC **picture,
+    const VAIQMatrixBufferHEVC **iq_matrix,
+    struct venus_hevc_slice *slices, size_t *num_slices)
+{
+    const struct venus_buffer *slice_parameters = NULL;
+    size_t index;
+
+    *picture = NULL;
+    *iq_matrix = NULL;
+    *num_slices = 0;
+    for (index = 0; index < context->pending_count; index++) {
+        const struct venus_buffer *buffer = venus_backend_find_buffer(
+            backend, context->pending[index]);
+        size_t bytes;
+
+        if (!buffer || !buffer->num_elements ||
+            buffer->element_size > SIZE_MAX / buffer->num_elements)
+            return -EINVAL;
+        bytes = buffer->element_size * buffer->num_elements;
+        if (!buffer->data || !bytes)
+            return -EINVAL;
+
+        switch (buffer->type) {
+        case VAPictureParameterBufferType:
+            if (*picture || buffer->num_elements != 1 ||
+                buffer->element_size <
+                    sizeof(VAPictureParameterBufferHEVC))
+                return -EINVAL;
+            *picture =
+                (const VAPictureParameterBufferHEVC *)buffer->data;
+            break;
+        case VAIQMatrixBufferType:
+            if (*iq_matrix || buffer->num_elements != 1 ||
+                buffer->element_size < sizeof(VAIQMatrixBufferHEVC))
+                return -EINVAL;
+            *iq_matrix = (const VAIQMatrixBufferHEVC *)buffer->data;
+            break;
+        case VASliceParameterBufferType:
+            if (slice_parameters ||
+                buffer->element_size <
+                    sizeof(VASliceParameterBufferHEVC))
+                return -EINVAL;
+            slice_parameters = buffer;
+            break;
+        case VASliceDataBufferType:
+            if (!slice_parameters || buffer->num_elements != 1 ||
+                slice_parameters->num_elements >
+                    VENUS_MAX_SLICE_BATCHES - *num_slices)
+                return -EINVAL;
+            for (size_t slice = 0;
+                 slice < slice_parameters->num_elements; slice++) {
+                const VASliceParameterBufferHEVC *parameters =
+                    (const VASliceParameterBufferHEVC *)
+                    (slice_parameters->data +
+                     slice * slice_parameters->element_size);
+
+                if (parameters->slice_data_flag !=
+                        VA_SLICE_DATA_FLAG_ALL ||
+                    parameters->slice_data_offset > bytes ||
+                    parameters->slice_data_size >
+                        bytes - parameters->slice_data_offset ||
+                    !parameters->slice_data_size)
+                    return -EINVAL;
+                slices[*num_slices] = (struct venus_hevc_slice) {
+                    .parameters = parameters,
+                    .data = buffer->data +
+                            parameters->slice_data_offset,
+                    .size = parameters->slice_data_size,
+                };
+                (*num_slices)++;
+            }
+            slice_parameters = NULL;
+            break;
+        default:
+            return -ENOTSUP;
+        }
+    }
+
+    return *picture && *num_slices && !slice_parameters
+               ? 0 : -EINVAL;
+}
+
+static int collect_vpx_frame(
+    struct venus_backend *backend, struct venus_context *context,
+    VAProfile profile, const uint8_t **data, size_t *size,
+    uint8_t **owned_data)
+{
+    const VAPictureParameterBufferVP8 *vp8_picture = NULL;
+    const VADecPictureParameterBufferVP9 *vp9_picture = NULL;
+    const VASliceParameterBufferVP8 *vp8_slice = NULL;
+    const VASliceParameterBufferVP9 *vp9_slice = NULL;
+    size_t index;
+
+    *data = NULL;
+    *size = 0;
+    *owned_data = NULL;
+    for (index = 0; index < context->pending_count; index++) {
+        const struct venus_buffer *buffer = venus_backend_find_buffer(
+            backend, context->pending[index]);
+        size_t bytes;
+
+        if (!buffer || !buffer->num_elements ||
+            buffer->element_size > SIZE_MAX / buffer->num_elements)
+            return -EINVAL;
+        bytes = buffer->element_size * buffer->num_elements;
+        if (!buffer->data || !bytes)
+            return -EINVAL;
+
+        switch (buffer->type) {
+        case VAPictureParameterBufferType:
+            if (profile == VAProfileVP8Version0_3) {
+                if (vp8_picture || buffer->num_elements != 1 ||
+                    buffer->element_size < sizeof(*vp8_picture))
+                    return -EINVAL;
+                vp8_picture =
+                    (const VAPictureParameterBufferVP8 *)buffer->data;
+            } else {
+                if (vp9_picture || buffer->num_elements != 1 ||
+                    buffer->element_size < sizeof(*vp9_picture))
+                    return -EINVAL;
+                vp9_picture =
+                    (const VADecPictureParameterBufferVP9 *)buffer->data;
+            }
+            break;
+        case VASliceParameterBufferType:
+            if (profile == VAProfileVP8Version0_3) {
+                if (vp8_slice || buffer->num_elements != 1 ||
+                    buffer->element_size < sizeof(*vp8_slice))
+                    return -EINVAL;
+                vp8_slice =
+                    (const VASliceParameterBufferVP8 *)buffer->data;
+            } else {
+                if (vp9_slice || buffer->num_elements != 1 ||
+                    buffer->element_size < sizeof(*vp9_slice))
+                    return -EINVAL;
+                vp9_slice =
+                    (const VASliceParameterBufferVP9 *)buffer->data;
+            }
+            break;
+        case VASliceDataBufferType:
+            /* The stateful decoder needs the original frame header too. */
+            if (*data || buffer->num_elements != 1)
+                return -ENOTSUP;
+            *data = buffer->data;
+            *size = bytes;
+            break;
+        case VAIQMatrixBufferType:
+        case VAProbabilityBufferType:
+            break;
+        default:
+            return -ENOTSUP;
+        }
+    }
+
+    if (!*data || *size < 3)
+        return -EINVAL;
+    if (profile == VAProfileVP8Version0_3) {
+        if (!vp8_picture || vp8_picture->frame_width != context->width ||
+            vp8_picture->frame_height != context->height ||
+            (vp8_slice &&
+             (vp8_slice->slice_data_flag != VA_SLICE_DATA_FLAG_ALL ||
+              vp8_slice->slice_data_offset > *size ||
+              vp8_slice->slice_data_size >
+                  *size - vp8_slice->slice_data_offset)))
+            return -EINVAL;
+        if (!vp8_slice || !vp8_slice->slice_data_size)
+            return -EINVAL;
+        {
+            uint64_t first_partition =
+                ((uint64_t)vp8_slice->macroblock_offset + 7u) / 8u +
+                vp8_slice->partition_size[0];
+            size_t header_size =
+                vp8_picture->pic_fields.bits.key_frame ? 3u : 10u;
+            uint32_t tag;
+            uint8_t *frame;
+
+            if (!first_partition || first_partition > 0x7ffffu ||
+                vp8_slice->slice_data_size > SIZE_MAX - header_size)
+                return -EINVAL;
+            /* VA passes VP8 compressed partitions without the frame tag. */
+            frame = malloc(header_size + vp8_slice->slice_data_size);
+            if (!frame)
+                return -ENOMEM;
+            tag = ((uint32_t)first_partition << 5) |
+                  (1u << 4) |
+                  (vp8_picture->pic_fields.bits.version << 1) |
+                  vp8_picture->pic_fields.bits.key_frame;
+            frame[0] = (uint8_t)tag;
+            frame[1] = (uint8_t)(tag >> 8);
+            frame[2] = (uint8_t)(tag >> 16);
+            if (header_size == 10u) {
+                frame[3] = 0x9d;
+                frame[4] = 0x01;
+                frame[5] = 0x2a;
+                frame[6] = (uint8_t)vp8_picture->frame_width;
+                frame[7] = (uint8_t)(vp8_picture->frame_width >> 8);
+                frame[8] = (uint8_t)vp8_picture->frame_height;
+                frame[9] = (uint8_t)(vp8_picture->frame_height >> 8);
+            }
+            memcpy(frame + header_size,
+                   *data + vp8_slice->slice_data_offset,
+                   vp8_slice->slice_data_size);
+            *data = frame;
+            *size = header_size + vp8_slice->slice_data_size;
+            *owned_data = frame;
+        }
+    } else {
+        if (!vp9_picture || vp9_picture->frame_width != context->width ||
+            vp9_picture->frame_height != context->height ||
+            (vp9_slice &&
+             (vp9_slice->slice_data_flag != VA_SLICE_DATA_FLAG_ALL ||
+              vp9_slice->slice_data_offset > *size ||
+              vp9_slice->slice_data_size > *size)))
+            return -EINVAL;
+        if (((*data)[0] & 0xf0u) != 0x80u)
+            return -ENOTSUP;
+    }
+
+    return 0;
+}
+
+static VAStatus backend_end_picture(VADriverContextP driver_context,
+                                    VAContextID context_id)
+{
+    struct venus_h264_slice_batch batches[VENUS_MAX_SLICE_BATCHES];
+    struct venus_hevc_slice hevc_slices[VENUS_MAX_SLICE_BATCHES];
+    const VAPictureParameterBufferH264 *picture;
+    const VAPictureParameterBufferHEVC *hevc_picture;
+    const VAIQMatrixBufferHEVC *hevc_iq;
+    struct venus_hevc_state *next_hevc_state = NULL;
+    struct venus_backend *backend =
+        venus_backend_from_context(driver_context);
+    struct venus_context *context;
+    struct venus_config *config;
+    uint8_t *access_unit = NULL;
+    size_t access_unit_capacity;
+    size_t access_unit_size = 0;
+    size_t num_batches;
+    size_t num_hevc_slices;
+    int status;
+
+    if (!backend)
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+    pthread_mutex_lock(&backend->mutex);
+    context = venus_backend_find_context(backend, context_id);
+    if (!context || !context->in_picture) {
+        pthread_mutex_unlock(&backend->mutex);
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+
+    config = venus_backend_find_config(backend, context->config_id);
+    if (!config) {
+        status = -EINVAL;
+        goto finish;
+    }
+
+    if (config->entrypoint == VAEntrypointEncSlice) {
+        VAStatus encode_status = venus_encode_end_picture_locked(
+            backend, context, config);
+
+        clear_pending(context);
+        context->in_picture = false;
+        context->target = VA_INVALID_ID;
+        pthread_mutex_unlock(&backend->mutex);
+        return encode_status;
+    }
+    if (config->entrypoint != VAEntrypointVLD) {
+        status = -ENOTSUP;
+        goto finish;
+    }
+
+    if (config->profile == VAProfileVP8Version0_3 ||
+        config->profile == VAProfileVP9Profile0) {
+        const uint8_t *frame;
+
+        status = collect_vpx_frame(backend, context,
+                                   config->profile, &frame,
+                                   &access_unit_size,
+                                   &access_unit);
+        if (status < 0)
+            goto finish;
+        status = venus_v4l2_decoder_submit(
+            context->decoder, frame, access_unit_size,
+            context->target, venus_decode_store_frame_locked, backend);
+    } else if (config->profile == VAProfileHEVCMain ||
+               config->profile == VAProfileHEVCMain10) {
+        status = collect_hevc_buffers(
+            backend, context, &hevc_picture, &hevc_iq,
+            hevc_slices, &num_hevc_slices);
+        if (status < 0)
+            goto finish;
+        status = venus_hevc_build_access_unit(
+            config->profile, hevc_picture, hevc_iq,
+            hevc_slices, num_hevc_slices, context->hevc_state,
+            &next_hevc_state, &access_unit, &access_unit_size);
+        if (status < 0)
+            goto finish;
+        status = venus_v4l2_decoder_submit(
+            context->decoder, access_unit, access_unit_size,
+            context->target, venus_decode_store_frame_locked, backend);
+        if (status == 0) {
+            venus_hevc_state_free(context->hevc_state);
+            context->hevc_state = next_hevc_state;
+            next_hevc_state = NULL;
+        }
+    } else {
+        status = collect_h264_buffers(
+            backend, context, &picture, batches, &num_batches,
+            &access_unit_capacity);
+        if (status < 0)
+            goto finish;
+
+        access_unit = malloc(access_unit_capacity);
+        if (!access_unit) {
+            status = -ENOMEM;
+            goto finish;
+        }
+
+        status = venus_h264_build_access_unit(
+            config->profile, picture, batches, num_batches,
+            access_unit, access_unit_capacity, &access_unit_size);
+        if (status < 0)
+            goto finish;
+
+        status = venus_v4l2_decoder_submit(
+            context->decoder, access_unit, access_unit_size,
+            context->target, venus_decode_store_frame_locked, backend);
+    }
+
+finish:
+    free(access_unit);
+    venus_hevc_state_free(next_hevc_state);
+    clear_pending(context);
+    context->in_picture = false;
+    context->target = VA_INVALID_ID;
+    pthread_mutex_unlock(&backend->mutex);
+    return status < 0 ? venus_backend_status_from_errno(status)
+                      : VA_STATUS_SUCCESS;
+}
+
+static VAStatus sync_surface_locked(struct venus_backend *backend,
+                                    struct venus_surface *surface,
+                                    int timeout_ms)
+{
+    struct venus_context *context;
+    int64_t deadline;
+
+    if (surface->encode_pending)
+        return venus_encode_sync_surface_locked(
+            backend, surface, timeout_ms);
+    if (surface->ready)
+        return VA_STATUS_SUCCESS;
+
+    context = venus_backend_find_context(
+        backend, surface->context_id);
+    if (!context)
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+    deadline = monotonic_milliseconds() + timeout_ms;
+    while (!surface->ready &&
+           monotonic_milliseconds() < deadline) {
+        int status = venus_v4l2_decoder_pump(
+            context->decoder, 1000,
+            venus_decode_store_frame_locked, backend, NULL);
+
+        if (status == -ETIMEDOUT || status == -EAGAIN)
+            continue;
+        if (status < 0)
+            return venus_backend_status_from_errno(status);
+    }
+
+    return surface->ready ? VA_STATUS_SUCCESS
+                          : VA_STATUS_ERROR_HW_BUSY;
+}
+
+static VAStatus backend_sync_surface(VADriverContextP driver_context,
+                                     VASurfaceID surface_id)
+{
+    struct venus_backend *backend =
+        venus_backend_from_context(driver_context);
+    struct venus_surface *surface;
+    VAStatus status;
+
+    if (!backend)
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+    pthread_mutex_lock(&backend->mutex);
+    surface = venus_backend_find_surface(backend, surface_id);
+    if (!surface) {
+        pthread_mutex_unlock(&backend->mutex);
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+
+    status = sync_surface_locked(
+        backend, surface, VENUS_SYNC_TIMEOUT_MS);
+    pthread_mutex_unlock(&backend->mutex);
+    return status;
+}
+
+static VAStatus backend_sync_surface2(
+    VADriverContextP driver_context, VASurfaceID surface_id,
+    uint64_t timeout_ns)
+{
+    struct venus_backend *backend =
+        venus_backend_from_context(driver_context);
+    struct venus_surface *surface;
+    uint64_t timeout_ms;
+    VAStatus status;
+
+    if (!backend)
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+    timeout_ms = timeout_ns == VA_TIMEOUT_INFINITE
+                     ? VENUS_SYNC_TIMEOUT_MS
+                     : (timeout_ns + 999999u) / 1000000u;
+    if (timeout_ms > INT_MAX)
+        timeout_ms = INT_MAX;
+
+    pthread_mutex_lock(&backend->mutex);
+    surface = venus_backend_find_surface(backend, surface_id);
+    if (!surface) {
+        pthread_mutex_unlock(&backend->mutex);
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+
+    status = sync_surface_locked(
+        backend, surface, (int)timeout_ms);
+    pthread_mutex_unlock(&backend->mutex);
+    return status;
+}
+
+static VAStatus backend_sync_buffer(
+    VADriverContextP driver_context, VABufferID buffer_id,
+    uint64_t timeout_ns)
+{
+    struct venus_backend *backend =
+        venus_backend_from_context(driver_context);
+    struct venus_buffer *buffer;
+    uint64_t timeout_ms;
+    VAStatus status;
+
+    if (!backend)
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+    timeout_ms = timeout_ns == VA_TIMEOUT_INFINITE
+                     ? VENUS_SYNC_TIMEOUT_MS
+                     : (timeout_ns + 999999u) / 1000000u;
+    if (timeout_ms > INT_MAX)
+        timeout_ms = INT_MAX;
+
+    pthread_mutex_lock(&backend->mutex);
+    buffer = venus_backend_find_buffer(backend, buffer_id);
+    if (!buffer || buffer->type != VAEncCodedBufferType) {
+        pthread_mutex_unlock(&backend->mutex);
+        return VA_STATUS_ERROR_INVALID_BUFFER;
+    }
+
+    status = venus_encode_sync_buffer_locked(
+        backend, buffer, (int)timeout_ms);
+    pthread_mutex_unlock(&backend->mutex);
+    return status;
+}
+
+static VAStatus backend_query_surface_status(
+    VADriverContextP driver_context, VASurfaceID surface_id,
+    VASurfaceStatus *surface_status)
+{
+    struct venus_backend *backend =
+        venus_backend_from_context(driver_context);
+    struct venus_surface *surface;
+
+    if (!backend || !surface_status)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    pthread_mutex_lock(&backend->mutex);
+    surface = venus_backend_find_surface(backend, surface_id);
+    if (!surface) {
+        pthread_mutex_unlock(&backend->mutex);
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+
+    *surface_status =
+        surface->ready && !surface->encode_pending
+            ? VASurfaceReady
+            : VASurfaceRendering;
+    pthread_mutex_unlock(&backend->mutex);
+    return VA_STATUS_SUCCESS;
+}
+
+void venus_decode_destroy_all(struct venus_backend *backend)
+{
+    unsigned int index;
+
+    for (index = 0; index < VENUS_MAX_CONTEXTS; index++)
+        destroy_context_locked(backend, &backend->contexts[index]);
+}
+
+void venus_decode_fill_vtable(struct VADriverVTable *vtable)
+{
+    vtable->vaCreateContext = backend_create_context;
+    vtable->vaDestroyContext = backend_destroy_context;
+    vtable->vaBeginPicture = backend_begin_picture;
+    vtable->vaRenderPicture = backend_render_picture;
+    vtable->vaEndPicture = backend_end_picture;
+    vtable->vaSyncSurface = backend_sync_surface;
+    vtable->vaSyncSurface2 = backend_sync_surface2;
+    vtable->vaSyncBuffer = backend_sync_buffer;
+    vtable->vaQuerySurfaceStatus = backend_query_surface_status;
+}
